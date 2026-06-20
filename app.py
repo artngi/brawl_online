@@ -7,10 +7,55 @@ app = Flask(__name__)
 # すべてのオリジンからのCORS接続を許可し、リアルタイムSocket.IOを確立
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-# プレイヤー情報管理: { sid: { "id": sid, "name": name, "lobby_id": lobby_id, "slot": slot, "brawler": brawler, "gadget": gadget, "sp": sp, "status": "idle"|"lobby"|"playing" } }
+# プレイヤー情報管理: { sid: { "id": sid, "name": name, "lobby_id": lobby_id, "status": status } }
 players = {}
-# ロビー情報管理: { lobby_id: { "id": lobby_id, "host_id": host, "members": [sid1, sid2], "mode": "gemgrab" } }
+# ロビー情報管理: { lobby_id: { "id": lobby_id, "host_id": host, "members": [sid1, sid2], "mode": "gemgrab", "slots_data": [...] } }
 lobbies = {}
+
+def broadcast_online_players():
+    """全オンラインプレイヤーの一覧を全員にブロードキャスト"""
+    online_list = [{
+        "id": p["id"],
+        "name": p["name"],
+        "status": p["status"],
+        "lobby_id": p["lobby_id"]
+    } for p in players.values()]
+    socketio.emit('online_players_update', online_list)
+
+def broadcast_lobby_update(lobby_id):
+    """ロビー内の全メンバーに最新のロビー状態とスロットデータを同期"""
+    if lobby_id in lobbies:
+        lobby = lobbies[lobby_id]
+        member_data = []
+        for m in lobby["members"]:
+            if m in players:
+                member_data.append(players[m])
+        emit('lobby_update', {
+            "lobby_id": lobby_id,
+            "host_id": lobby["host_id"],
+            "mode": lobby["mode"],
+            "members": member_data,
+            "slots_data": lobby["slots_data"]
+        }, room=lobby_id)
+
+def leave_lobby_logic(sid, lobby_id):
+    """ロビーからの退出処理ロジック"""
+    if lobby_id in lobbies:
+        lobby = lobbies[lobby_id]
+        if sid in lobby["members"]:
+            lobby["members"].remove(sid)
+            leave_room(lobby_id, sid=sid)
+        
+        if sid in players:
+            players[sid]["lobby_id"] = None
+            players[sid]["status"] = "idle"
+            
+        if not lobby["members"]:
+            lobbies.pop(lobby_id, None)
+        else:
+            if lobby["host_id"] == sid:
+                lobby["host_id"] = lobby["members"][0]
+            broadcast_lobby_update(lobby_id)
 
 @app.route('/')
 def index():
@@ -23,11 +68,7 @@ def handle_connect():
         "id": sid,
         "name": "ブロワラー",
         "lobby_id": None,
-        "slot": 0,
-        "brawler": "pius",
-        "gadget": "shield_absorb",
-        "sp": "auto_aim",
-        "status": "idle" # idle, lobby, playing
+        "status": "idle"  # idle, lobby, playing
     }
     broadcast_online_players()
 
@@ -42,181 +83,110 @@ def handle_disconnect():
         players.pop(sid, None)
     broadcast_online_players()
 
-def broadcast_online_players():
-    # 接続中の全員に現在のオンラインプレイヤー一覧を送信
-    socketio.emit('online_players', list(players.values()))
-
-@socketio.on('join_server')
-def handle_join_server(data):
+@socketio.on('update_profile')
+def handle_update_profile(data):
     sid = request.sid
     if sid in players:
         players[sid]["name"] = data.get("name", "ブロワラー")
-        players[sid]["brawler"] = data.get("brawler", "pius")
-        players[sid]["gadget"] = data.get("gadget", "shield_absorb")
-        players[sid]["sp"] = data.get("sp", "auto_aim")
-    broadcast_online_players()
+        broadcast_online_players()
+        lobby_id = players[sid]["lobby_id"]
+        if lobby_id:
+            broadcast_lobby_update(lobby_id)
 
-@socketio.on('send_invite')
-def handle_send_invite(data):
-    # 特定のプレイヤーに招待を送信
-    target_sid = data.get("target_id")
-    sender_sid = request.sid
-    if target_sid in players and sender_sid in players:
+@socketio.on('invite_player')
+def handle_invite_player(data):
+    """他のプレイヤーにロビーへの招待を送る"""
+    sid = request.sid
+    target_id = data.get("target_id")
+    if sid in players and target_id in players:
+        player = players[sid]
+        lobby_id = player["lobby_id"]
+        
+        # ロビーがまだなければ新規作成
+        if not lobby_id:
+            lobby_id = str(uuid.uuid4())
+            lobbies[lobby_id] = {
+                "id": lobby_id,
+                "host_id": sid,
+                "members": [sid],
+                "mode": "gemgrab",
+                "slots_data": None
+            }
+            player["lobby_id"] = lobby_id
+            player["status"] = "lobby"
+            join_room(lobby_id, sid=sid)
+            broadcast_lobby_update(lobby_id)
+            
+        # ターゲットに招待イベントを直接送信
         emit('receive_invite', {
-            "sender_id": sender_sid,
-            "sender_name": players[sender_sid]["name"]
-        }, room=target_sid)
+            "from_id": sid,
+            "from_name": player["name"],
+            "lobby_id": lobby_id
+        }, room=target_id)
 
 @socketio.on('respond_invite')
 def handle_respond_invite(data):
-    sender_id = data.get("sender_id") # 招待を送った側
-    response = data.get("response") # "accept" or "decline"
-    guest_id = request.sid # 招待を受けた側
-
-    if response == "accept":
-        if sender_id in players and guest_id in players:
-            # 送信側のロビーを取得、なければ新規作成
-            lobby_id = players[sender_id]["lobby_id"]
-            if not lobby_id:
-                lobby_id = str(uuid.uuid4())
-                lobbies[lobby_id] = {
-                    "id": lobby_id,
-                    "host_id": sender_id,
-                    "members": [sender_id],
-                    "mode": "gemgrab"
-                }
-                players[sender_id]["lobby_id"] = lobby_id
-                players[sender_id]["slot"] = 0
-                players[sender_id]["status"] = "lobby"
-                join_room(lobby_id, sid=sender_id)
-
-            # 受信側をロビーに追加
-            lobby = lobbies[lobby_id]
-            if guest_id not in lobby["members"]:
-                lobby["members"].append(guest_id)
-                players[guest_id]["lobby_id"] = lobby_id
-                players[guest_id]["status"] = "lobby"
-                # 空いているスロットを割り当て
-                assigned_slot = find_empty_slot(lobby_id)
-                players[guest_id]["slot"] = assigned_slot
-                join_room(lobby_id, sid=guest_id)
-            
-            # ロビー状態を全員に同期
-            sync_lobby_state(lobby_id)
-            broadcast_online_players()
-    else:
-        # 拒否されたことを送信側に通知
-        if sender_id in players:
-            emit('invite_declined', {"guest_name": players[guest_id]["name"]}, room=sender_id)
-
-def find_empty_slot(lobby_id):
-    lobby = lobbies.get(lobby_id)
-    if not lobby:
-        return 1
-    occupied_slots = [players[m]["slot"] for m in lobby["members"] if m in players]
-    for s in range(0, 17): # 0~16のスロット
-        if s not in occupied_slots:
-            return s
-    return 1
-
-def leave_lobby_logic(sid, lobby_id):
-    if lobby_id in lobbies:
-        lobby = lobbies[lobby_id]
-        if sid in lobby["members"]:
-            lobby["members"].remove(sid)
-            leave_room(lobby_id, sid=sid)
+    """招待に対する許可・拒否の応答"""
+    sid = request.sid
+    lobby_id = data.get("lobby_id")
+    accept = data.get("accept")
+    from_id = data.get("from_id")
+    
+    if not accept:
+        if from_id in players:
+            emit('invite_declined', {"by_name": players[sid]["name"]}, room=from_id)
+        return
         
-        if sid in players:
-            players[sid]["lobby_id"] = None
-            players[sid]["status"] = "idle"
-            players[sid]["slot"] = 0
-
-        # ホストが抜けたら次の人をホストにするか、ロビーを解散
-        if lobby["host_id"] == sid:
-            if len(lobby["members"]) > 0:
-                lobby["host_id"] = lobby["members"][0]
-                sync_lobby_state(lobby_id)
-            else:
-                lobbies.pop(lobby_id, None)
-        else:
-            sync_lobby_state(lobby_id)
-
-@socketio.on('leave_lobby')
-def handle_leave_lobby():
-    sid = request.sid
-    if sid in players:
-        lobby_id = players[sid]["lobby_id"]
-        if lobby_id:
-            leave_lobby_logic(sid, lobby_id)
-    broadcast_online_players()
-
-@socketio.on('update_lobby_settings')
-def handle_update_lobby_settings(data):
-    sid = request.sid
-    if sid in players:
-        lobby_id = players[sid]["lobby_id"]
-        if lobby_id and lobbies[lobby_id]["host_id"] == sid:
-            lobbies[lobby_id]["mode"] = data.get("mode", "gemgrab")
-            sync_lobby_state(lobby_id)
-
-@socketio.on('select_slot')
-def handle_select_slot(data):
-    sid = request.sid
-    target_slot = data.get("slot")
-    if sid in players:
-        lobby_id = players[sid]["lobby_id"]
-        if lobby_id and lobby_id in lobbies:
-            lobby = lobbies[lobby_id]
-            # 既に他のプレイヤーがそのスロットを使っていないかチェック
-            slot_occupied = False
-            for m in lobby["members"]:
-                if m != sid and players[m]["slot"] == target_slot:
-                    slot_occupied = True
-                    break
+    if lobby_id in lobbies and sid in players:
+        # 既存のロビーがあれば抜ける
+        old_lobby_id = players[sid]["lobby_id"]
+        if old_lobby_id:
+            leave_lobby_logic(sid, old_lobby_id)
             
-            if not slot_occupied:
-                players[sid]["slot"] = target_slot
-                sync_lobby_state(lobby_id)
+        lobby = lobbies[lobby_id]
+        if len(lobby["members"]) < 6:
+            lobby["members"].append(sid)
+            players[sid]["lobby_id"] = lobby_id
+            players[sid]["status"] = "lobby"
+            join_room(lobby_id, sid=sid)
+            broadcast_lobby_update(lobby_id)
+            broadcast_online_players()
+        else:
+            emit('error_message', {"message": "ロビーが満員です"}, room=sid)
 
-@socketio.on('sync_character_custom')
-def handle_sync_character_custom(data):
+@socketio.on('sync_lobby_slots')
+def handle_sync_lobby_slots(data):
+    """ロビー内のスロットやモード変更を全メンバーに同期"""
     sid = request.sid
     if sid in players:
-        players[sid]["brawler"] = data.get("brawler")
-        players[sid]["gadget"] = data.get("gadget")
-        players[sid]["sp"] = data.get("sp")
         lobby_id = players[sid]["lobby_id"]
-        if lobby_id:
-            sync_lobby_state(lobby_id)
+        if lobby_id in lobbies:
+            lobbies[lobby_id]["slots_data"] = data.get("slots")
+            lobbies[lobby_id]["mode"] = data.get("mode")
+            emit('lobby_slots_updated', {
+                "slots": lobbies[lobby_id]["slots_data"],
+                "mode": lobbies[lobby_id]["mode"],
+                "host_id": lobbies[lobby_id]["host_id"]
+            }, room=lobby_id, include_self=False)
 
-def sync_lobby_state(lobby_id):
-    if lobby_id in lobbies:
-        lobby = lobbies[lobby_id]
-        member_data = []
-        for m in lobby["members"]:
-            if m in players:
-                member_data.append(players[m])
-        emit('lobby_update', {
-            "lobby_id": lobby_id,
-            "host_id": lobby["host_id"],
-            "mode": lobby["mode"],
-            "members": member_data
-        }, room=lobby_id)
-
-# 試合の開始
 @socketio.on('start_match')
-def handle_start_match():
+def handle_start_match(data):
+    """ホストが試合を開始した合図を全員に送信"""
     sid = request.sid
     if sid in players:
         lobby_id = players[sid]["lobby_id"]
         if lobby_id and lobbies[lobby_id]["host_id"] == sid:
+            lobbies[lobby_id]["slots_data"] = data.get("slots")
             for m in lobbies[lobby_id]["members"]:
                 if m in players:
                     players[m]["status"] = "playing"
-            emit('match_started', room=lobby_id)
+            emit('match_started', {
+                "slots": lobbies[lobby_id]["slots_data"],
+                "mode": lobbies[lobby_id]["mode"]
+            }, room=lobby_id)
             broadcast_online_players()
 
-# プレイ中の同期パケット
+# プレイ中の座標・ステータスのリアルタイム同期パケット
 @socketio.on('game_sync_state')
 def handle_game_sync_state(data):
     sid = request.sid
@@ -224,7 +194,6 @@ def handle_game_sync_state(data):
         lobby_id = players[sid]["lobby_id"]
         if lobby_id:
             data["sender_sid"] = sid
-            # 自分以外の同じロビーのメンバーに座標などの状態を送信
             emit('game_sync_receive', data, room=lobby_id, include_self=False)
 
 # プレイ中の攻撃トリガー同期

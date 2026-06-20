@@ -7,9 +7,9 @@ app = Flask(__name__)
 # すべてのオリジンからのCORS接続を許可し、リアルタイムSocket.IOを確立
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-# プレイヤー情報管理: { sid: { "id": sid, "name": name, "lobby_id": lobby_id, "slot": slot, "brawler": brawler, "gadget": gadget, "sp": sp, "ready": bool } }
+# プレイヤー情報管理: { sid: { "id": sid, "name": name, "lobby_id": lobby_id, "slot": slot, "brawler": brawler, "gadget": gadget, "sp": sp, "status": "idle"|"lobby"|"playing" } }
 players = {}
-# ロビー情報管理: { lobby_id: { "id": lobby_id, "host_id": host, "members": [sid1, sid2], "mode": "gemgrab", "slots_data": [...] } }
+# ロビー情報管理: { lobby_id: { "id": lobby_id, "host_id": host, "members": [sid1, sid2], "mode": "gemgrab" } }
 lobbies = {}
 
 @app.route('/')
@@ -29,6 +29,7 @@ def handle_connect():
         "sp": "auto_aim",
         "status": "idle" # idle, lobby, playing
     }
+    broadcast_online_players()
 
 @socketio.on('disconnect')
 def handle_disconnect():
@@ -42,14 +43,17 @@ def handle_disconnect():
     broadcast_online_players()
 
 def broadcast_online_players():
-    # 接続中の全員にプレイヤー一覧を送信
-    emit('online_players', list(players.values()), broadcast=True)
+    # 接続中の全員に現在のオンラインプレイヤー一覧を送信
+    socketio.emit('online_players', list(players.values()))
 
 @socketio.on('join_server')
 def handle_join_server(data):
     sid = request.sid
     if sid in players:
         players[sid]["name"] = data.get("name", "ブロワラー")
+        players[sid]["brawler"] = data.get("brawler", "pius")
+        players[sid]["gadget"] = data.get("gadget", "shield_absorb")
+        players[sid]["sp"] = data.get("sp", "auto_aim")
     broadcast_online_players()
 
 @socketio.on('send_invite')
@@ -92,7 +96,7 @@ def handle_respond_invite(data):
                 lobby["members"].append(guest_id)
                 players[guest_id]["lobby_id"] = lobby_id
                 players[guest_id]["status"] = "lobby"
-                # 空いているスロットを探して割り当て
+                # 空いているスロットを割り当て
                 assigned_slot = find_empty_slot(lobby_id)
                 players[guest_id]["slot"] = assigned_slot
                 join_room(lobby_id, sid=guest_id)
@@ -110,7 +114,7 @@ def find_empty_slot(lobby_id):
     if not lobby:
         return 1
     occupied_slots = [players[m]["slot"] for m in lobby["members"] if m in players]
-    for s in range(1, 17):
+    for s in range(0, 17): # 0~16のスロット
         if s not in occupied_slots:
             return s
     return 1

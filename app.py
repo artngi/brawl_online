@@ -1,239 +1,226 @@
 import os
-import uuid
 from flask import Flask, request
 from flask_socketio import SocketIO, emit, join_room, leave_room
+import uuid
 
 app = Flask(__name__)
-# すべてのオリジンからのCORS接続を許可し、リアルタイムSocket.IOを確立
+# すべてのオリジンからのアクセスを許可
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-# プレイヤー情報管理: { sid: { "id": sid, "uid": uid, "name": name, "lobby_id": lobby_id, "slot": slot, "brawler": brawler, "gadget": gadget, "sp": sp, "status": status } }
+# プレイヤーデータベース
+# 構造: { uid: { "uid": str, "name": str, "brawler": str, "gadget": str, "sp": str, "team_id": int, "online": bool, "sid": str, "room_id": str } }
 players = {}
-# ロビー情報管理: { lobby_id: { "id": lobby_id, "host_id": host, "members": [sid1, sid2], "mode": "gemgrab" } }
-lobbies = {}
+sid_to_uid = {}
+
+# 招待状の追跡
+# { invite_id: { "from_uid": str, "to_uid": str } }
+invites = {}
 
 @app.route('/')
 def index():
-    return "Brawl Clone Matchmaking Server is Running!"
+    return "Brawl Clone Online Server is Running!"
 
 @socketio.on('connect')
 def handle_connect():
-    sid = request.sid
-    players[sid] = {
-        "id": sid,
-        "uid": "", # クライアント側のUUID用
-        "name": "ブロワラー",
-        "lobby_id": None,
-        "slot": 0,
-        "brawler": "pius",
-        "gadget": "shield_absorb",
-        "sp": "auto_aim",
-        "status": "idle" # idle, lobby, playing
-    }
+    pass
 
 @socketio.on('disconnect')
 def handle_disconnect():
     sid = request.sid
-    if sid in players:
-        player = players[sid]
-        lobby_id = player["lobby_id"]
-        if lobby_id:
-            leave_lobby_logic(sid, lobby_id)
-        players.pop(sid, None)
-    broadcast_online_players()
-
-def broadcast_online_players():
-    # 接続中の全員にプレイヤー一覧を送信
-    emit('online_players', list(players.values()), broadcast=True)
-
-@socketio.on('join_server')
-def handle_join_server(data):
-    sid = request.sid
-    if sid in players:
-        players[sid]["name"] = data.get("name", "ブロワラー")
-        players[sid]["uid"] = data.get("uid", "") # クライアント固有のUIDを保存
-    broadcast_online_players()
-
-@socketio.on('send_invite')
-def handle_send_invite(data):
-    # 特定のプレイヤーに招待を送信
-    target_sid = data.get("target_id")
-    sender_sid = request.sid
-    if target_sid in players and sender_sid in players:
-        emit('receive_invite', {
-            "sender_id": sender_sid,
-            "sender_name": players[sender_sid]["name"]
-        }, room=target_sid)
-
-@socketio.on('respond_invite')
-def handle_respond_invite(data):
-    sender_id = data.get("sender_id") # 招待を送った側
-    response = data.get("response") # "accept" or "decline"
-    guest_id = request.sid # 招待を受けた側
-
-    if response == "accept":
-        if sender_id in players and guest_id in players:
-            # 送信側のロビーを取得、なければ新規作成
-            lobby_id = players[sender_id]["lobby_id"]
-            if not lobby_id:
-                lobby_id = str(uuid.uuid4())
-                lobbies[lobby_id] = {
-                    "id": lobby_id,
-                    "host_id": sender_id,
-                    "members": [sender_id],
-                    "mode": "gemgrab"
-                }
-                players[sender_id]["lobby_id"] = lobby_id
-                players[sender_id]["slot"] = 0
-                players[sender_id]["status"] = "lobby"
-                join_room(lobby_id, sid=sender_id)
-
-            # 受信側をロビーに追加
-            lobby = lobbies[lobby_id]
-            if guest_id not in lobby["members"]:
-                lobby["members"].append(guest_id)
-                players[guest_id]["lobby_id"] = lobby_id
-                players[guest_id]["status"] = "lobby"
-                # 空いているスロットを探して割り当て
-                assigned_slot = find_empty_slot(lobby_id)
-                players[guest_id]["slot"] = assigned_slot
-                join_room(lobby_id, sid=guest_id)
+    if sid in sid_to_uid:
+        uid = sid_to_uid[sid]
+        if uid in players:
+            players[uid]['online'] = False
+            players[uid]['sid'] = None
             
-            # ロビー状態を全員に同期
-            sync_lobby_state(lobby_id)
-            broadcast_online_players()
-    else:
-        # 拒否されたことを送信側に通知
-        if sender_id in players:
-            emit('invite_declined', {"guest_name": players[guest_id]["name"]}, room=sender_id)
+            # 参加していたルームがある場合は退出通知
+            room_id = players[uid].get('room_id')
+            if room_id:
+                leave_room(room_id, sid=sid)
+                players[uid]['room_id'] = None
+                emit('room_update', get_room_players(room_id), to=room_id)
+                
+        del sid_to_uid[sid]
+    broadcast_players()
 
-def find_empty_slot(lobby_id):
-    lobby = lobbies.get(lobby_id)
-    if not lobby:
-        return 1
-    occupied_slots = [players[m]["slot"] for m in lobby["members"] if m in players]
-    for s in range(0, 17): # 0番から空きを探すように修正
-        if s not in occupied_slots:
-            return s
-    return 1
+@socketio.on('register_player')
+def handle_register(data):
+    sid = request.sid
+    uid = data.get('uid')
+    name = data.get('name', 'ブロワラー')
+    brawler = data.get('brawler', 'shelly')
+    gadget = data.get('gadget', 'random')
+    sp = data.get('sp', 'random')
+    team_id = data.get('team_id', 1)  # 1: 青, 2: 赤
 
-def leave_lobby_logic(sid, lobby_id):
-    if lobby_id in lobbies:
-        lobby = lobbies[lobby_id]
-        if sid in lobby["members"]:
-            lobby["members"].remove(sid)
-            leave_room(lobby_id, sid=sid)
+    if not uid:
+        uid = str(uuid.uuid4())
+
+    sid_to_uid[sid] = uid
+    
+    players[uid] = {
+        'uid': uid,
+        'sid': sid,
+        'name': name,
+        'brawler': brawler,
+        'gadget': gadget,
+        'sp': sp,
+        'team_id': team_id,
+        'online': True,
+        'room_id': players.get(uid, {}).get('room_id', None) # 既存の部屋があれば引き継ぐ
+    }
+
+    emit('registration_success', {'uid': uid})
+    broadcast_players()
+    
+    # すでに部屋にいるならデータを再送信
+    room_id = players[uid]['room_id']
+    if room_id:
+        join_room(room_id, sid=sid)
+        emit('room_update', get_room_players(room_id), to=room_id)
+
+@socketio.on('update_player_data')
+def handle_update(data):
+    sid = request.sid
+    if sid in sid_to_uid:
+        uid = sid_to_uid[sid]
+        if uid in players:
+            players[uid]['name'] = data.get('name', players[uid]['name'])
+            players[uid]['brawler'] = data.get('brawler', players[uid]['brawler'])
+            players[uid]['gadget'] = data.get('gadget', players[uid]['gadget'])
+            players[uid]['sp'] = data.get('sp', players[uid]['sp'])
+            players[uid]['team_id'] = data.get('team_id', players[uid]['team_id'])
+            
+            broadcast_players()
+            
+            room_id = players[uid].get('room_id')
+            if room_id:
+                emit('room_update', get_room_players(room_id), to=room_id)
+
+@socketio.on('send_challenge')
+def handle_challenge(data):
+    sid = request.sid
+    target_uid = data.get('target_uid')
+    if sid in sid_to_uid:
+        challenger_uid = sid_to_uid[sid]
+        challenger = players.get(challenger_uid)
+        target = players.get(target_uid)
+
+        if challenger and target and target['online'] and target['sid']:
+            invite_id = f"invite_{uuid.uuid4().hex[:8]}"
+            invites[invite_id] = {
+                'from_uid': challenger_uid,
+                'to_uid': target_uid
+            }
+            emit('challenge_received', {
+                'invite_id': invite_id,
+                'challenger_uid': challenger_uid,
+                'challenger_name': challenger['name']
+            }, to=target['sid'])
+
+@socketio.on('respond_challenge')
+def handle_response(data):
+    sid = request.sid
+    invite_id = data.get('invite_id')
+    accepted = data.get('accepted')
+
+    if invite_id in invites and sid in sid_to_uid:
+        invite = invites[invite_id]
+        target_uid = sid_to_uid[sid]
+        challenger_uid = invite['from_uid']
         
-        if sid in players:
-            players[sid]["lobby_id"] = None
-            players[sid]["status"] = "idle"
-            players[sid]["slot"] = 0
+        target = players.get(target_uid)
+        challenger = players.get(challenger_uid)
 
-        # ホストが抜けたら次の人をホストにするか、ロビーを解散
-        if lobby["host_id"] == sid:
-            if len(lobby["members"]) > 0:
-                lobby["host_id"] = lobby["members"][0]
-                sync_lobby_state(lobby_id)
+        if challenger and target:
+            if accepted:
+                # すでに別の部屋に入っている場合は退出
+                for uid in [challenger_uid, target_uid]:
+                    old_room = players[uid].get('room_id')
+                    if old_room:
+                        leave_room(old_room, sid=players[uid]['sid'])
+                
+                # 新しい共通ルームを作成 (ホストのUIDを部屋IDとする)
+                room_id = f"room_{challenger_uid}"
+                
+                players[challenger_uid]['room_id'] = room_id
+                players[target_uid]['room_id'] = room_id
+                
+                # 自分(青チーム)と相手(赤チーム)に初期設定
+                players[challenger_uid]['team_id'] = 1
+                players[target_uid]['team_id'] = 2
+
+                join_room(room_id, sid=challenger['sid'])
+                join_room(room_id, sid=target['sid'])
+
+                # メンバー間で部屋同期
+                emit('room_joined', {'room_id': room_id, 'is_host': True}, to=challenger['sid'])
+                emit('room_joined', {'room_id': room_id, 'is_host': False}, to=target['sid'])
+                
+                room_players = get_room_players(room_id)
+                emit('room_update', room_players, to=room_id)
             else:
-                lobbies.pop(lobby_id, None)
-        else:
-            sync_lobby_state(lobby_id)
-
-@socketio.on('leave_lobby')
-def handle_leave_lobby():
-    sid = request.sid
-    if sid in players:
-        lobby_id = players[sid]["lobby_id"]
-        if lobby_id:
-            leave_lobby_logic(sid, lobby_id)
-    broadcast_online_players()
-
-@socketio.on('update_lobby_settings')
-def handle_update_lobby_settings(data):
-    sid = request.sid
-    if sid in players:
-        lobby_id = players[sid]["lobby_id"]
-        if lobby_id and lobbies[lobby_id]["host_id"] == sid:
-            lobbies[lobby_id]["mode"] = data.get("mode", "gemgrab")
-            sync_lobby_state(lobby_id)
-
-@socketio.on('select_slot')
-def handle_select_slot(data):
-    sid = request.sid
-    target_slot = data.get("slot")
-    if sid in players:
-        lobby_id = players[sid]["lobby_id"]
-        if lobby_id and lobby_id in lobbies:
-            lobby = lobbies[lobby_id]
-            # 既に他のプレイヤーがそのスロットを使っていないかチェック
-            slot_occupied = False
-            for m in lobby["members"]:
-                if m != sid and players[m]["slot"] == target_slot:
-                    slot_occupied = True
-                    break
+                if challenger['online'] and challenger['sid']:
+                    emit('challenge_rejected', {'msg': f"{target['name']}さんに招待を断られました"}, to=challenger['sid'])
             
-            if not slot_occupied:
-                players[sid]["slot"] = target_slot
-                sync_lobby_state(lobby_id)
+            # 招待を削除
+            del invites[invite_id]
 
-@socketio.on('sync_character_custom')
-def handle_sync_character_custom(data):
+@socketio.on('leave_room')
+def handle_leave_room():
     sid = request.sid
-    if sid in players:
-        players[sid]["brawler"] = data.get("brawler")
-        players[sid]["gadget"] = data.get("gadget")
-        players[sid]["sp"] = data.get("sp")
-        lobby_id = players[sid]["lobby_id"]
-        if lobby_id:
-            sync_lobby_state(lobby_id)
+    if sid in sid_to_uid:
+        uid = sid_to_uid[sid]
+        if uid in players:
+            room_id = players[uid].get('room_id')
+            if room_id:
+                leave_room(room_id, sid=sid)
+                players[uid]['room_id'] = None
+                # ロビー（シングルプレイヤー）に戻す
+                emit('room_left')
+                emit('room_update', get_room_players(room_id), to=room_id)
 
-def sync_lobby_state(lobby_id):
-    if lobby_id in lobbies:
-        lobby = lobbies[lobby_id]
-        member_data = []
-        for m in lobby["members"]:
-            if m in players:
-                member_data.append(players[m])
-        emit('lobby_update', {
-            "lobby_id": lobby_id,
-            "host_id": lobby["host_id"],
-            "mode": lobby["mode"],
-            "members": member_data
-        }, room=lobby_id)
-
-# 試合の開始
-@socketio.on('start_match')
-def handle_start_match():
+@socketio.on('trigger_game_start')
+def handle_trigger_game_start(data):
     sid = request.sid
-    if sid in players:
-        lobby_id = players[sid]["lobby_id"]
-        if lobby_id and lobbies[lobby_id]["host_id"] == sid:
-            for m in lobbies[lobby_id]["members"]:
-                if m in players:
-                    players[m]["status"] = "playing"
-            emit('match_started', room=lobby_id)
-            broadcast_online_players()
+    if sid in sid_to_uid:
+        uid = sid_to_uid[sid]
+        if uid in players:
+            room_id = players[uid].get('room_id')
+            if room_id:
+                # 部屋のホストのみが開始可能
+                if room_id == f"room_{uid}":
+                    emit('game_start_signal', {
+                        'mode': data.get('mode', 'gemgrab')
+                    }, to=room_id)
 
-# プレイ中の同期パケット
-@socketio.on('game_sync_state')
-def handle_game_sync_state(data):
-    sid = request.sid
-    if sid in players:
-        lobby_id = players[sid]["lobby_id"]
-        if lobby_id:
-            data["sender_sid"] = sid
-            # 自分以外の同じロビーのメンバーに座標などの状態を送信
-            emit('game_sync_receive', data, room=lobby_id, include_self=False)
+def get_room_players(room_id):
+    # 特定の部屋に所属しているプレイヤーを抽出
+    room_members = []
+    for p in players.values():
+        if p.get('room_id') == room_id and p['online']:
+            room_members.append({
+                'uid': p['uid'],
+                'name': p['name'],
+                'brawler': p['brawler'],
+                'gadget': p['gadget'],
+                'sp': p['sp'],
+                'team_id': p['team_id']
+            })
+    return room_members
 
-# プレイ中の攻撃トリガー同期
-@socketio.on('game_sync_action')
-def handle_game_sync_action(data):
-    sid = request.sid
-    if sid in players:
-        lobby_id = players[sid]["lobby_id"]
-        if lobby_id:
-            data["sender_sid"] = sid
-            emit('game_sync_action_receive', data, room=lobby_id, include_self=False)
+def broadcast_players():
+    # 全プレイヤーのリスト（sidなどのプライベートな値は除外）
+    serialized = []
+    for p in players.values():
+        if p['online']:
+            serialized.append({
+                'uid': p['uid'],
+                'name': p['name'],
+                'brawler': p['brawler'],
+                'online': p['online']
+            })
+    emit('update_players', serialized, broadcast=True)
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
